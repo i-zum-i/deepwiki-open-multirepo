@@ -1,0 +1,313 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-northeast-1.amazonaws.com
+
+jobs:
+  # 単体テスト
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.11]
+        node-version: [18]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Set up Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+
+    - name: Install Python dependencies
+      run: |
+        cd api
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-asyncio
+
+    - name: Install Node.js dependencies
+      run: |
+        npm ci
+
+    - name: Run Python tests
+      run: |
+        cd api
+        pytest --cov=. --cov-report=xml --cov-report=html
+
+    - name: Run TypeScript type check
+      run: |
+        npm run build
+
+    - name: Run ESLint
+      run: |
+        npm run lint
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./api/coverage.xml
+        flags: backend
+        name: backend-coverage
+
+  # セキュリティスキャン
+  security:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Run Bandit security linter for Python
+      run: |
+        pip install bandit
+        bandit -r api/ -f json -o bandit-report.json || true
+
+    - name: Upload Bandit results
+      uses: actions/upload-artifact@v3
+      with:
+        name: bandit-report
+        path: bandit-report.json
+
+  # Dockerイメージビルド
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push API image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        target: api
+        push: true
+        tags: |
+          ${{ env.ECR_REGISTRY }}/deepwiki-omr-${{ github.ref_name }}-api:latest
+          ${{ env.ECR_REGISTRY }}/deepwiki-omr-${{ github.ref_name }}-api:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push Worker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        target: worker
+        push: true
+        tags: |
+          ${{ env.ECR_REGISTRY }}/deepwiki-omr-${{ github.ref_name }}-worker:latest
+          ${{ env.ECR_REGISTRY }}/deepwiki-omr-${{ github.ref_name }}-worker:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # ステージング環境デプロイ
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install CDK
+      run: |
+        npm install -g aws-cdk
+        cd infrastructure/cdk
+        pip install -r requirements.txt
+
+    - name: Deploy to staging
+      run: |
+        cd infrastructure/cdk
+        cdk deploy --all -c environment=staging --require-approval never
+
+    - name: Update ECS service
+      run: |
+        aws ecs update-service \
+          --cluster deepwiki-omr-staging-cluster \
+          --service deepwiki-omr-staging-api \
+          --force-new-deployment
+
+        aws ecs update-service \
+          --cluster deepwiki-omr-staging-cluster \
+          --service deepwiki-omr-staging-worker \
+          --force-new-deployment
+
+    - name: Wait for deployment
+      run: |
+        aws ecs wait services-stable \
+          --cluster deepwiki-omr-staging-cluster \
+          --services deepwiki-omr-staging-api deepwiki-omr-staging-worker
+
+  # 統合テスト
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install test dependencies
+      run: |
+        pip install pytest pytest-asyncio requests
+
+    - name: Run integration tests
+      env:
+        STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+      run: |
+        cd test
+        pytest integration/ -v
+
+  # 本番環境デプロイ
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build, integration-test]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install CDK
+      run: |
+        npm install -g aws-cdk
+        cd infrastructure/cdk
+        pip install -r requirements.txt
+
+    - name: Deploy to production
+      run: |
+        cd infrastructure/cdk
+        cdk deploy --all -c environment=prod --require-approval never
+
+    - name: Update ECS service (Blue-Green deployment)
+      run: |
+        # 新しいタスク定義でサービスを更新
+        aws ecs update-service \
+          --cluster deepwiki-omr-prod-cluster \
+          --service deepwiki-omr-prod-api \
+          --force-new-deployment
+
+        aws ecs update-service \
+          --cluster deepwiki-omr-prod-cluster \
+          --service deepwiki-omr-prod-worker \
+          --force-new-deployment
+
+    - name: Wait for deployment
+      run: |
+        aws ecs wait services-stable \
+          --cluster deepwiki-omr-prod-cluster \
+          --services deepwiki-omr-prod-api deepwiki-omr-prod-worker
+
+    - name: Run smoke tests
+      env:
+        PROD_API_URL: ${{ secrets.PROD_API_URL }}
+      run: |
+        cd test
+        pytest smoke/ -v
+
+  # 通知
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+
+    steps:
+    - name: Notify Slack on success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: 'DeepWiki-OMR deployment to production succeeded! :rocket:'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Notify Slack on failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: 'DeepWiki-OMR deployment failed! :x:'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

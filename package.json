@@ -6,7 +6,19 @@
     "dev": "next dev --turbopack --port 3000",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "type-check": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:ci": "jest --ci --coverage --watchAll=false",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:debug": "playwright test --debug",
+    "dev:setup": "node scripts/dev-setup.js",
+    "dev:start": "docker-compose -f docker-compose.dev.yml up -d",
+    "dev:stop": "docker-compose -f docker-compose.dev.yml down",
+    "dev:logs": "docker-compose -f docker-compose.dev.yml logs -f",
+    "dev:clean": "docker-compose -f docker-compose.dev.yml down -v --remove-orphans"
   },
   "dependencies": {
     "mermaid": "^11.4.1",
@@ -29,8 +41,15 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "@types/jest": "^29.5.0",
+    "@testing-library/react": "^14.0.0",
+    "@testing-library/jest-dom": "^6.0.0",
+    "@testing-library/user-event": "^14.0.0",
+    "@playwright/test": "^1.40.0",
     "eslint": "^9",
     "eslint-config-next": "15.3.1",
+    "jest": "^29.5.0",
+    "jest-environment-jsdom": "^29.5.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

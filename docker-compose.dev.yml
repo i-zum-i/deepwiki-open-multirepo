@@ -1,0 +1,232 @@
+version: '3.8'
+
+services:
+  # DynamoDB Local
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: deepwiki-omr-dynamodb-local
+    ports:
+      - "8000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "./data"]
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    networks:
+      - deepwiki-omr-network
+
+  # OpenSearch (Elasticsearch互換)
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: deepwiki-omr-opensearch
+    environment:
+      - cluster.name=deepwiki-omr-cluster
+      - node.name=deepwiki-omr-node
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "DISABLE_INSTALL_DEMO_CONFIG=true"
+      - "DISABLE_SECURITY_PLUGIN=true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - deepwiki-omr-network
+
+  # OpenSearch Dashboards
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: deepwiki-omr-opensearch-dashboards
+    ports:
+      - "5601:5601"
+    expose:
+      - "5601"
+    environment:
+      - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
+      - "DISABLE_SECURITY_DASHBOARDS_PLUGIN=true"
+    depends_on:
+      - opensearch
+    networks:
+      - deepwiki-omr-network
+
+  # Redis (SQSの代替として使用)
+  redis:
+    image: redis:7-alpine
+    container_name: deepwiki-omr-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - deepwiki-omr-network
+
+  # MinIO (S3の代替として使用)
+  minio:
+    image: minio/minio:latest
+    container_name: deepwiki-omr-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - deepwiki-omr-network
+
+  # MinIO Client (バケット作成用)
+  minio-client:
+    image: minio/mc:latest
+    container_name: deepwiki-omr-minio-client
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin123;
+      /usr/bin/mc mb myminio/deepwiki-omr-dev-content --ignore-existing;
+      /usr/bin/mc policy set public myminio/deepwiki-omr-dev-content;
+      exit 0;
+      "
+    networks:
+      - deepwiki-omr-network
+
+  # API サーバー (開発用)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: api
+    container_name: deepwiki-omr-api-dev
+    ports:
+      - "8001:8001"
+    environment:
+      - ENVIRONMENT=development
+      - AWS_DEFAULT_REGION=ap-northeast-1
+      - AWS_ACCESS_KEY_ID=dummy
+      - AWS_SECRET_ACCESS_KEY=dummy
+      - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      - OPENSEARCH_ENDPOINT=http://opensearch:9200
+      - S3_ENDPOINT=http://minio:9000
+      - REDIS_URL=redis://redis:6379
+      - DYNAMODB_REPOS_TABLE=deepwiki-omr-dev-repos
+      - DYNAMODB_PAGES_TABLE=deepwiki-omr-dev-pages
+      - DYNAMODB_JOBS_TABLE=deepwiki-omr-dev-jobs
+      - S3_CONTENT_BUCKET=deepwiki-omr-dev-content
+    volumes:
+      - ./api:/app/api
+      - ./docs:/app/docs
+      - api-cache:/app/.cache
+    depends_on:
+      - dynamodb-local
+      - opensearch
+      - redis
+      - minio
+    networks:
+      - deepwiki-omr-network
+    restart: unless-stopped
+
+  # ワーカー (開発用)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: worker
+    container_name: deepwiki-omr-worker-dev
+    environment:
+      - ENVIRONMENT=development
+      - AWS_DEFAULT_REGION=ap-northeast-1
+      - AWS_ACCESS_KEY_ID=dummy
+      - AWS_SECRET_ACCESS_KEY=dummy
+      - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      - OPENSEARCH_ENDPOINT=http://opensearch:9200
+      - S3_ENDPOINT=http://minio:9000
+      - REDIS_URL=redis://redis:6379
+      - DYNAMODB_REPOS_TABLE=deepwiki-omr-dev-repos
+      - DYNAMODB_PAGES_TABLE=deepwiki-omr-dev-pages
+      - DYNAMODB_JOBS_TABLE=deepwiki-omr-dev-jobs
+      - S3_CONTENT_BUCKET=deepwiki-omr-dev-content
+    volumes:
+      - ./api:/app/api
+      - ./docs:/app/docs
+      - worker-cache:/app/.cache
+    depends_on:
+      - dynamodb-local
+      - opensearch
+      - redis
+      - minio
+    networks:
+      - deepwiki-omr-network
+    restart: unless-stopped
+
+  # フロントエンド (開発用)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: frontend
+    container_name: deepwiki-omr-frontend-dev
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8001
+    volumes:
+      - ./src:/app/src
+      - ./public:/app/public
+      - ./package.json:/app/package.json
+      - ./package-lock.json:/app/package-lock.json
+      - ./next.config.ts:/app/next.config.ts
+      - ./tailwind.config.js:/app/tailwind.config.js
+      - ./tsconfig.json:/app/tsconfig.json
+      - frontend-node-modules:/app/node_modules
+    depends_on:
+      - api
+    networks:
+      - deepwiki-omr-network
+    restart: unless-stopped
+
+  # DynamoDB Admin (管理用UI)
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin:latest
+    container_name: deepwiki-omr-dynamodb-admin
+    ports:
+      - "8001:8001"
+    environment:
+      - DYNAMO_ENDPOINT=http://dynamodb-local:8000
+      - AWS_REGION=ap-northeast-1
+      - AWS_ACCESS_KEY_ID=dummy
+      - AWS_SECRET_ACCESS_KEY=dummy
+    depends_on:
+      - dynamodb-local
+    networks:
+      - deepwiki-omr-network
+
+volumes:
+  dynamodb-data:
+    driver: local
+  opensearch-data:
+    driver: local
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
+  api-cache:
+    driver: local
+  worker-cache:
+    driver: local
+  frontend-node-modules:
+    driver: local
+
+networks:
+  deepwiki-omr-network:
+    driver: bridge

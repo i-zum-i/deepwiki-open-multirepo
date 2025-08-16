@@ -1,107 +1,128 @@
-# syntax=docker/dockerfile:1-labs
+# 本番用マルチステージDockerfile
 
-# Build argument for custom certificates directory
-ARG CUSTOM_CERT_DIR="certs"
+# ベースイメージ
+FROM python:3.11-slim as python-base
 
-FROM node:20-alpine3.22 AS node_base
+# 環境変数の設定
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-FROM node_base AS node_deps
+# 作業ディレクトリの設定
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --legacy-peer-deps
 
-FROM node_base AS node_builder
+# システムの依存関係をインストール
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Python依存関係のインストール
+COPY api/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 非rootユーザーの作成
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# API サーバー用ステージ
+FROM python-base as api
+
+# APIコードのコピー
+COPY api/ /app/api/
+COPY docs/ /app/docs/
+
+# ファイルの所有権を変更
+RUN chown -R appuser:appuser /app
+
+# 非rootユーザーに切り替え
+USER appuser
+
+# ヘルスチェック
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# ポート8000を公開
+EXPOSE 8000
+
+# 本番用の起動コマンド
+CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+
+# ワーカー用ステージ
+FROM python-base as worker
+
+# APIコードのコピー（ワーカーもAPIコードを使用）
+COPY api/ /app/api/
+COPY docs/ /app/docs/
+
+# ファイルの所有権を変更
+RUN chown -R appuser:appuser /app
+
+# 非rootユーザーに切り替え
+USER appuser
+
+# ワーカー用の起動コマンド
+CMD ["python", "-m", "api.worker"]
+
+# フロントエンド用ステージ
+FROM node:18-alpine as frontend-deps
+
 WORKDIR /app
-COPY --from=node_deps /app/node_modules ./node_modules
-# Copy only necessary files for Next.js build
-COPY package.json package-lock.json next.config.ts tsconfig.json tailwind.config.js postcss.config.mjs ./
+
+# package.jsonとpackage-lock.jsonをコピー
+COPY package*.json ./
+
+# 依存関係のインストール
+RUN npm ci --only=production && npm cache clean --force
+
+# フロントエンドビルドステージ
+FROM node:18-alpine as frontend-builder
+
+WORKDIR /app
+
+# 依存関係をコピー
+COPY --from=frontend-deps /app/node_modules ./node_modules
+COPY package*.json ./
+
+# ソースコードのコピー
 COPY src/ ./src/
 COPY public/ ./public/
-# Increase Node.js memory limit for build and disable telemetry
-ENV NODE_OPTIONS="--max-old-space-size=4096"
-ENV NEXT_TELEMETRY_DISABLED=1
-RUN NODE_ENV=production npm run build
+COPY next.config.ts ./
+COPY tailwind.config.js ./
+COPY tsconfig.json ./
+COPY postcss.config.mjs ./
 
-FROM python:3.11-slim AS py_deps
-WORKDIR /app
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-COPY api/requirements.txt ./api/
-RUN pip install --no-cache -r api/requirements.txt
+# アプリケーションのビルド
+RUN npm run build
 
-# Use Python 3.11 as final image
-FROM python:3.11-slim
+# フロントエンド本番用ステージ
+FROM node:18-alpine as frontend
 
-# Set working directory
 WORKDIR /app
 
-# Install Node.js and npm
-RUN apt-get update && apt-get install -y \
-    curl \
-    gnupg \
-    git \
-    ca-certificates \
-    && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update \
-    && apt-get install -y nodejs \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# 非rootユーザーの作成
+RUN addgroup -g 1001 -S nodejs
+RUN adduser -S nextjs -u 1001
 
-# Update certificates if custom ones were provided and copied successfully
-RUN if [ -n "${CUSTOM_CERT_DIR}" ]; then \
-        mkdir -p /usr/local/share/ca-certificates && \
-        if [ -d "${CUSTOM_CERT_DIR}" ]; then \
-            cp -r ${CUSTOM_CERT_DIR}/* /usr/local/share/ca-certificates/ 2>/dev/null || true; \
-            update-ca-certificates; \
-            echo "Custom certificates installed successfully."; \
-        else \
-            echo "Warning: ${CUSTOM_CERT_DIR} not found. Skipping certificate installation."; \
-        fi \
-    fi
+# 必要なファイルのコピー
+COPY --from=frontend-builder /app/public ./public
+COPY --from=frontend-builder /app/package.json ./package.json
 
-ENV PATH="/opt/venv/bin:$PATH"
+# ビルド成果物のコピー
+COPY --from=frontend-builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=frontend-builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-# Copy Python dependencies
-COPY --from=py_deps /opt/venv /opt/venv
-COPY api/ ./api/
+# 非rootユーザーに切り替え
+USER nextjs
 
-# Copy Node app
-COPY --from=node_builder /app/public ./public
-COPY --from=node_builder /app/.next/standalone ./
-COPY --from=node_builder /app/.next/static ./.next/static
+# ポート3000を公開
+EXPOSE 3000
 
-# Expose the port the app runs on
-EXPOSE ${PORT:-8001} 3000
+# 環境変数の設定
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
 
-# Create a script to run both backend and frontend
-RUN echo '#!/bin/bash\n\
-# Load environment variables from .env file if it exists\n\
-if [ -f .env ]; then\n\
-  export $(grep -v "^#" .env | xargs -r)\n\
-fi\n\
-\n\
-# Check for required environment variables\n\
-if [ -z "$OPENAI_API_KEY" ] || [ -z "$GOOGLE_API_KEY" ]; then\n\
-  echo "Warning: OPENAI_API_KEY and/or GOOGLE_API_KEY environment variables are not set."\n\
-  echo "These are required for DeepWiki to function properly."\n\
-  echo "You can provide them via a mounted .env file or as environment variables when running the container."\n\
-fi\n\
-\n\
-# Start the API server in the background with the configured port\n\
-python -m api.main --port ${PORT:-8001} &\n\
-PORT=3000 HOSTNAME=0.0.0.0 node server.js &\n\
-wait -n\n\
-exit $?' > /app/start.sh && chmod +x /app/start.sh
-
-# Set environment variables
-ENV PORT=8001
-ENV NODE_ENV=production
-ENV SERVER_BASE_URL=http://localhost:${PORT:-8001}
-
-# Create empty .env file (will be overridden if one exists at runtime)
-RUN touch .env
-
-# Command to run the application
-CMD ["/app/start.sh"]
+# 本番サーバーの起動
+CMD ["node", "server.js"]

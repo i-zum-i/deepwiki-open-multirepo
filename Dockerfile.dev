@@ -1,0 +1,70 @@
+# 開発用マルチステージDockerfile
+
+# ベースイメージ
+FROM python:3.11-slim as base
+
+# 作業ディレクトリの設定
+WORKDIR /app
+
+# システムの依存関係をインストール
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python依存関係のインストール
+COPY api/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Node.js のインストール (フロントエンド用)
+RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs
+
+# API サーバー用ステージ
+FROM base as api
+
+# APIコードのコピー
+COPY api/ /app/api/
+COPY docs/ /app/docs/
+
+# ポート8001を公開
+EXPOSE 8001
+
+# 開発用の起動コマンド
+CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+
+# ワーカー用ステージ
+FROM base as worker
+
+# APIコードのコピー（ワーカーもAPIコードを使用）
+COPY api/ /app/api/
+COPY docs/ /app/docs/
+
+# ワーカー用の起動コマンド
+CMD ["python", "-m", "api.worker"]
+
+# フロントエンド用ステージ
+FROM node:18-slim as frontend
+
+WORKDIR /app
+
+# package.jsonとpackage-lock.jsonをコピー
+COPY package*.json ./
+
+# 依存関係のインストール
+RUN npm ci
+
+# ソースコードのコピー
+COPY src/ ./src/
+COPY public/ ./public/
+COPY next.config.ts ./
+COPY tailwind.config.js ./
+COPY tsconfig.json ./
+COPY postcss.config.mjs ./
+
+# ポート3000を公開
+EXPOSE 3000
+
+# 開発サーバーの起動
+CMD ["npm", "run", "dev"]
