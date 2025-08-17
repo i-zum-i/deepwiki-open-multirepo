@@ -12,6 +12,8 @@ import asyncio
 
 # Configure logging
 from api.logging_config import setup_logging
+# Import routers
+from api.routers import repositories
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -19,8 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Streaming API",
-    description="API for streaming chat completions"
+    title="DeepWiki API",
+    description="API for DeepWiki-OMR",
+    version="1.0.0"
 )
 
 # Configure CORS
@@ -31,6 +34,9 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+# Include routers
+app.include_router(repositories.router, prefix="/api")
 
 # Helper function to get adalflow root path
 def get_adalflow_default_root_path():
@@ -147,25 +153,25 @@ class AuthorizationConfig(BaseModel):
 from api.config import configs, WIKI_AUTH_MODE, WIKI_AUTH_CODE
 
 @app.get("/lang/config")
-async def get_lang_config():
+def get_lang_config():
     return configs["lang_config"]
 
 @app.get("/auth/status")
-async def get_auth_status():
+def get_auth_status():
     """
     Check if authentication is required for the wiki.
     """
     return {"auth_required": WIKI_AUTH_MODE}
 
 @app.post("/auth/validate")
-async def validate_auth_code(request: AuthorizationConfig):
+def validate_auth_code(request: AuthorizationConfig):
     """
     Check authorization code.
     """
     return {"success": WIKI_AUTH_CODE == request.code}
 
 @app.get("/models/config", response_model=ModelConfig)
-async def get_model_config():
+def get_model_config():
     """
     Get available model providers and their models.
 
@@ -225,7 +231,7 @@ async def get_model_config():
         )
 
 @app.post("/export/wiki")
-async def export_wiki(request: WikiExportRequest):
+def export_wiki(request: WikiExportRequest):
     """
     Export wiki content as Markdown or JSON.
 
@@ -273,7 +279,7 @@ async def export_wiki(request: WikiExportRequest):
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/local_repo/structure")
-async def get_local_repo_structure(path: str = Query(None, description="Path to local repository")):
+def get_local_repo_structure(path: str = Query(None, description="Path to local repository")):
     """Return the file tree and README content for a local repository."""
     if not path:
         return JSONResponse(
@@ -459,7 +465,7 @@ async def save_wiki_cache(data: WikiCacheRequest) -> bool:
 # --- Wiki Cache API Endpoints ---
 
 @app.get("/api/wiki_cache", response_model=Optional[WikiCacheData])
-async def get_cached_wiki(
+def get_cached_wiki(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g., github, gitlab)"),
@@ -484,7 +490,7 @@ async def get_cached_wiki(
         return None
 
 @app.post("/api/wiki_cache")
-async def store_wiki_cache(request_data: WikiCacheRequest):
+def store_wiki_cache(request_data: WikiCacheRequest):
     """
     Stores generated wiki data (structure and pages) to the server-side cache.
     """
@@ -502,7 +508,7 @@ async def store_wiki_cache(request_data: WikiCacheRequest):
         raise HTTPException(status_code=500, detail="Failed to save wiki cache")
 
 @app.delete("/api/wiki_cache")
-async def delete_wiki_cache(
+def delete_wiki_cache(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g., github, gitlab)"),
@@ -538,7 +544,7 @@ async def delete_wiki_cache(
         raise HTTPException(status_code=404, detail="Wiki cache not found")
 
 @app.get("/health")
-async def health_check():
+def health_check():
     """Health check endpoint for Docker and monitoring"""
     return {
         "status": "healthy",
@@ -547,7 +553,7 @@ async def health_check():
     }
 
 @app.get("/")
-async def root():
+def root():
     """Root endpoint to check if the API is running and list available endpoints dynamically."""
     # Collect routes dynamically from the FastAPI app
     endpoints = {}
@@ -575,7 +581,7 @@ async def root():
 
 # --- Processed Projects Endpoint --- (New Endpoint)
 @app.get("/api/processed_projects", response_model=List[ProcessedProjectEntry])
-async def get_processed_projects():
+def get_processed_projects():
     """
     Lists all processed projects found in the wiki cache directory.
     Projects are identified by files named like: deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json
